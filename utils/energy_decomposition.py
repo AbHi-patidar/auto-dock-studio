@@ -11,6 +11,10 @@ try:
     import plotly.graph_objects as go
 except ImportError:
     go = None
+try:
+    from scipy.spatial import cKDTree
+except ImportError:
+    cKDTree = None
 from typing import Dict, List, Tuple
 
 # Standard partial charges for amino acid polar/charged sidechains (AMBER ff14SB approximation)
@@ -54,6 +58,11 @@ def compute_residue_decomposition(protein_pdb_lines: List[str], ligand_pdbqt_lin
     """
     Computes per-residue binding energy contributions (vdW, Electrostatics, H-bonds)
     between protein binding site residues and the docked ligand.
+
+    NOTE: These are QUALITATIVE estimates from a heuristic 12-6 Lennard-Jones +
+    distance-binned H-bond scoring model — not rigorous free energies. Values
+    are deliberately NOT clamped to cosmetic ranges; treat large magnitudes
+    as flags of the model's approximations, not as precise measurements.
     """
     prot_atoms = parse_pdb_atoms(protein_pdb_lines)
     lig_atoms = parse_pdb_atoms(ligand_pdbqt_lines)
@@ -64,6 +73,34 @@ def compute_residue_decomposition(protein_pdb_lines: List[str], ligand_pdbqt_lin
     lig_coords = np.array([a["coord"] for a in lig_atoms if a["elem"] != "H"])
     if len(lig_coords) == 0:
         lig_coords = np.array([a["coord"] for a in lig_atoms])
+
+    # Bounding-box pre-filter: only protein atoms within (cutoff + margin) of
+    # the ligand bounding box can possibly interact. Replaces the previous
+    # unfiltered O(protein x ligand) double loop.
+    lig_min = lig_coords.min(axis=0) - (cutoff_distance + 2.0)
+    lig_max = lig_coords.max(axis=0) + (cutoff_distance + 2.0)
+    prot_atoms = [
+        a for a in prot_atoms
+        if np.all(a["coord"] >= lig_min) and np.all(a["coord"] <= lig_max)
+    ]
+    if not prot_atoms:
+        return pd.DataFrame()
+
+    # Pair discovery: cKDTree when scipy is available, bounded brute force otherwise.
+    prot_coords = np.array([a["coord"] for a in prot_atoms])
+    lig_all_coords = np.array([a["coord"] for a in lig_atoms])
+    if cKDTree is not None:
+        tree = cKDTree(lig_all_coords)
+        neighbors = tree.query_ball_point(prot_coords, r=cutoff_distance)
+        pair_indices = {
+            (pi, li) for pi, lidx in enumerate(neighbors) for li in lidx
+        }
+    else:
+        pair_indices = set()
+        for pi, pa in enumerate(prot_atoms):
+            for li, la in enumerate(lig_atoms):
+                if float(np.linalg.norm(pa["coord"] - la["coord"])) <= cutoff_distance:
+                    pair_indices.add((pi, li))
 
     # Group protein atoms by residue
     res_map = {}
@@ -78,15 +115,53 @@ def compute_residue_decomposition(protein_pdb_lines: List[str], ligand_pdbqt_lin
                 "atoms": []
             }
         res_map[rid]["atoms"].append(a)
+    atom_to_res = {id(a): rid for rid, data in res_map.items() for a in data["atoms"]}
 
-    results = []
-    
+    # Accumulate per-protein-atom pair contributions, then aggregate by residue
+    atom_vdw = {}
+    atom_elec = {}
+    atom_hbond = {}
+    atom_hydro = {}
+    atom_min_dist = {}
+
     # Dielectric constant for active site interior
     epsilon_r = 4.0
     coulomb_const = 332.0637  # kcal*A / (mol*e^2)
 
+    for pi, li in pair_indices:
+        pa = prot_atoms[pi]
+        la = lig_atoms[li]
+        if pa["elem"] == "H":
+            continue
+        p_coord = pa["coord"]
+        l_coord = la["coord"]
+        d = float(np.linalg.norm(p_coord - l_coord))
+        if d > cutoff_distance or d <= 0.8:
+            continue
+
+        atom_min_dist[pi] = min(atom_min_dist.get(pi, 999.0), d)
+
+        # 1. 12-6 Lennard-Jones vdW approximation (sigma ~ 3.5 A, epsilon ~ 0.12)
+        sigma = 3.6
+        eps = 0.12
+        ratio = sigma / d
+        lj = 4.0 * eps * (math.pow(min(ratio, 1.8), 12) - math.pow(min(ratio, 1.8), 6))
+        atom_vdw[pi] = atom_vdw.get(pi, 0.0) + lj * 0.15
+
+        # 2. Polar / H-bond interactions
+        p_is_polar = pa["elem"] in ["N", "O", "S"]
+        l_is_polar = la["elem"] in ["N", "O", "S", "F"]
+        if p_is_polar and l_is_polar and 2.5 <= d <= 3.5:
+            atom_hbond[pi] = atom_hbond.get(pi, 0) + 1
+            atom_elec[pi] = atom_elec.get(pi, 0.0) - 1.8  # ~1.8 kcal/mol per H-bond
+
+        # 3. Hydrophobic contacts
+        if pa["elem"] == "C" and la["elem"] == "C" and 3.0 <= d <= 4.5:
+            atom_hydro[pi] = atom_hydro.get(pi, 0) + 1
+            atom_vdw[pi] = atom_vdw.get(pi, 0.0) - 0.15
+
+    results = []
     for rid, data in res_map.items():
-        res_atoms = data["atoms"]
         min_dist = 999.0
         vdw_energy = 0.0
         elec_energy = 0.0
@@ -95,35 +170,16 @@ def compute_residue_decomposition(protein_pdb_lines: List[str], ligand_pdbqt_lin
 
         res_charge = RESIDUE_NET_CHARGES.get(data["res_name"], 0.0)
 
-        for pa in res_atoms:
-            p_coord = pa["coord"]
-            for la in lig_atoms:
-                l_coord = la["coord"]
-                d = float(np.linalg.norm(p_coord - l_coord))
-                if d < min_dist:
-                    min_dist = d
-
-                if d <= cutoff_distance and d > 0.8:
-                    # 1. 12-6 Lennard-Jones vdW approximation
-                    # sigma ~ 3.5 A, epsilon ~ 0.15 kcal/mol
-                    sigma = 3.6
-                    eps = 0.12
-                    ratio = sigma / d
-                    # Clamped LJ potential to avoid singularity
-                    lj = 4.0 * eps * (math.pow(min(ratio, 1.8), 12) - math.pow(min(ratio, 1.8), 6))
-                    vdw_energy += lj * 0.15
-
-                    # 2. Polar / H-bond interactions
-                    p_is_polar = pa["elem"] in ["N", "O", "S"]
-                    l_is_polar = la["elem"] in ["N", "O", "S", "F"]
-                    if p_is_polar and l_is_polar and 2.5 <= d <= 3.5:
-                        hbond_count += 1
-                        elec_energy -= 1.8  # ~1.8 kcal/mol per H-bond stabilization
-
-                    # 3. Hydrophobic contacts
-                    if pa["elem"] == "C" and la["elem"] == "C" and 3.0 <= d <= 4.5:
-                        hydrophobic_contacts += 1
-                        vdw_energy -= 0.15
+        # Aggregate per-atom contributions for this residue
+        for idx, a in enumerate(prot_atoms):
+            if atom_to_res.get(id(a)) != rid:
+                continue
+            vdw_energy += atom_vdw.get(idx, 0.0)
+            elec_energy += atom_elec.get(idx, 0.0)
+            hbond_count += atom_hbond.get(idx, 0)
+            hydrophobic_contacts += atom_hydro.get(idx, 0)
+            if idx in atom_min_dist and atom_min_dist[idx] < min_dist:
+                min_dist = atom_min_dist[idx]
 
         # If residue is within binding pocket interaction radius
         if min_dist <= cutoff_distance:
@@ -132,9 +188,7 @@ def compute_residue_decomposition(protein_pdb_lines: List[str], ligand_pdbqt_lin
                 # Approximate ligand center charge interaction
                 elec_energy += (res_charge * -0.5 * coulomb_const) / (epsilon_r * max(min_dist, 2.5)) * 0.05
 
-            # Clamp realistic physiological ranges
-            vdw_energy = max(min(vdw_energy, 4.0), -6.0)
-            elec_energy = max(min(elec_energy, 3.0), -8.0)
+            # No cosmetic clamping: values are qualitative estimates (see docstring)
             total_energy = round(vdw_energy + elec_energy, 2)
 
             results.append({
@@ -202,7 +256,7 @@ def generate_decomposition_plot(df: pd.DataFrame, top_n: int = 15):
 
     fig.update_layout(
         title=dict(
-            text="<b>Per-Residue Binding Free Energy Decomposition (kcal/mol)</b>",
+            text="<b>Per-Residue Interaction Energy Decomposition (kcal/mol) — Qualitative Estimates</b>",
             font=dict(family="Inter, sans-serif", size=15, color="#0f172a")
         ),
         barmode="relative",

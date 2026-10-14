@@ -6,8 +6,15 @@ blind docking grid calculation, and PDBQT conversion.
 
 import os
 import re
+import logging
 import urllib.request
+import urllib.error
 import numpy as np
+
+logger = logging.getLogger("autodock_studio")
+
+# PDB IDs are 4 alphanumeric characters starting with a digit (e.g. 1HSG, 6LU7)
+PDB_ID_PATTERN = re.compile(r"^[0-9][A-Za-z0-9]{3}$")
 
 STANDARD_RESIDUES = {
     "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS",
@@ -27,10 +34,25 @@ ESSENTIAL_COFACTORS = {"HEM", "NAD", "NAP", "FAD", "FMN", "ATP", "ADP", "GTP", "
 def fetch_pdb_from_rcsb(pdb_id: str, output_path: str) -> str:
     """Download standard PDB file from RCSB database."""
     pdb_id = pdb_id.strip().upper()
+    if not PDB_ID_PATTERN.match(pdb_id):
+        raise ValueError(
+            f"Invalid PDB ID '{pdb_id}': must be 4 characters starting with a digit (e.g. '1HSG')."
+        )
     url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
     req = urllib.request.Request(url, headers={"User-Agent": "AutoDockStudio/1.0"})
-    with urllib.request.urlopen(req) as resp:
-        content = resp.read().decode("utf-8")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(
+            f"RCSB download failed for PDB ID '{pdb_id}': HTTP {e.code} ({e.reason}). "
+            "Check that the ID exists on rcsb.org."
+        ) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"Could not reach the RCSB PDB server for '{pdb_id}': {e.reason}. "
+            "Check your network connection and try again."
+        ) from e
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(content)
     return output_path
@@ -88,6 +110,11 @@ def clean_protein_pdb(
                 hetero_atoms[resname].append(line)
 
     # Write cleaned protein
+    if not protein_atoms:
+        raise ValueError(
+            f"No protein ATOM records found in '{input_pdb}'. "
+            "The file may be empty, malformed, or contain no standard residues."
+        )
     with open(output_pdb, "w", encoding="utf-8") as f:
         for line in protein_atoms:
             f.write(line)
@@ -155,7 +182,16 @@ def compute_blind_docking_box(clean_pdb_path: str, padding: float = 6.0) -> dict
     # Span with padding, clamped to max 90 A for Vina practical limits
     min_pt = c_arr.min(axis=0) - padding
     max_pt = c_arr.max(axis=0) + padding
-    size = np.clip(max_pt - min_pt, 20.0, 90.0).round(2).tolist()
+    raw_size = max_pt - min_pt
+    size = np.clip(raw_size, 20.0, 90.0).round(2).tolist()
+    if np.any(raw_size > 90.0):
+        # The box no longer envelops the whole protein: warn loudly.
+        logger.warning(
+            "Blind-docking box clamped to 90.0 A (raw span was %s A). "
+            "The search box does NOT cover the full protein surface; "
+            "consider docking specific domains separately.",
+            np.round(raw_size, 1).tolist()
+        )
 
     return {
         "center": center,

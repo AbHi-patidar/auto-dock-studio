@@ -7,21 +7,34 @@ and generates manuscript-ready scientific interpretations and molecular mechanis
 import math
 
 def calculate_inhibition_constant(delta_g_kcal: float, temperature_k: float = 298.15):
+    """
+    Thermodynamic inhibition constant Ki = exp(dG / RT).
+
+    Uses the RAW delta G value. (A previous version forced dG negative via
+    -abs(), which overstated potency by ~1000x for unfavorable binders:
+    e.g. dG = +2.0 kcal/mol was reported as Ki ~ 34 mM instead of ~29 M.)
+    Positive dG (unfavorable) yields Ki > 1 M and is flagged as non-binding.
+    """
     rt = 0.001987204 * temperature_k
-    d_g = -abs(delta_g_kcal)
     try:
-        ki_molar = math.exp(d_g / rt)
+        ki_molar = math.exp(delta_g_kcal / rt)
     except OverflowError:
-        return 0.0, "N/A"
+        # Hugely unfavorable dG -> astronomically large Ki
+        return float("inf"), "> 1e6 M (non-binding)"
+
+    binding_note = " (non-binding)" if delta_g_kcal > 0 else ""
 
     if ki_molar < 1e-9:
-        return ki_molar, f"{ki_molar * 1e12:.2f} pM"
+        ki_str = f"{ki_molar * 1e12:.2f} pM"
     elif ki_molar < 1e-6:
-        return ki_molar, f"{ki_molar * 1e9:.2f} nM"
+        ki_str = f"{ki_molar * 1e9:.2f} nM"
     elif ki_molar < 1e-3:
-        return ki_molar, f"{ki_molar * 1e6:.2f} µM"
+        ki_str = f"{ki_molar * 1e6:.2f} µM"
+    elif ki_molar < 1e3:
+        ki_str = f"{ki_molar * 1e3:.2f} mM"
     else:
-        return ki_molar, f"{ki_molar * 1e3:.2f} mM"
+        ki_str = f"{ki_molar:.2f} M"
+    return ki_molar, ki_str + binding_note
 
 def calculate_ligand_efficiency(delta_g_kcal: float, num_heavy_atoms: int):
     if num_heavy_atoms <= 0:
@@ -47,7 +60,11 @@ def generate_scientific_interpretation(
     salt_bridges = interactions.get("salt_bridges", [])
     pocket_res = interactions.get("pocket_residues", [])
 
-    if abs_aff >= 9.0:
+    if affinity > 0:
+        tier = "Non-Binding (Unfavorable ΔG)"
+        tier_desc = "shows a positive binding free energy, indicating no spontaneous binding; the reported Ki exceeds 1 M."
+        tier_color = "#f87171"
+    elif abs_aff >= 9.0:
         tier = "High-Affinity / Potent Binder"
         tier_desc = "displays exceptionally strong thermodynamic stability, indicating sub-micromolar or nanomolar inhibitory potential."
         tier_color = "#22c55e"

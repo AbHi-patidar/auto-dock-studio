@@ -5,8 +5,18 @@ to evaluate docked protein-ligand stability, binding thermodynamics, and MM-PBSA
 """
 
 import os
+import re
 import zipfile
 import io
+
+def _sanitize_label(value: str) -> str:
+    """
+    Restricts user-controlled names to filesystem- and code-safe characters.
+    Prevents code injection when the name is interpolated into generated
+    Python (e.g. a '"' or newline in a ligand name would otherwise break
+    out of a string literal in run_openmm.py).
+    """
+    return re.sub(r"[^A-Za-z0-9_.\-]", "_", str(value)) or "unnamed"
 
 def generate_openmm_script(
     protein_pdb_name: str,
@@ -23,6 +33,8 @@ def generate_openmm_script(
     featuring AMBER14 forcefield, GAFF2 ligand parameterization, explicit TIP3P water box,
     neutralizing ions, NVT/NPT equilibration, and production MD with DCD trajectory logging.
     """
+    protein_pdb_name = _sanitize_label(protein_pdb_name)
+    ligand_name = _sanitize_label(ligand_name)
     total_steps = int((sim_time_ns * 1_000_000) / timestep_fs)
     save_interval = int(10_000 / timestep_fs)  # Record frame every 10 ps
 
@@ -220,6 +232,12 @@ DispCorr                = EnerPres
 # GROMACS MD Simulation Runner
 set -e
 echo "Starting GROMACS Protein-Ligand Simulation Workflow..."
+# TODO: `gmx pdb2gmx -f complex.pdb` on a protein-LIGAND complex will fail on the
+# ligand HETATM records: pdb2gmx cannot build a ligand topology from a force
+# field alone. A production pipeline must parameterize the ligand separately
+# (e.g. with Antechamber/ACPYPE to generate ligand .itp files) and merge the
+# topologies before solvation. The steps below therefore require manual topology
+# preparation for the ligand before they can run as-is.
 gmx pdb2gmx -f complex.pdb -o complex_processed.gro -water tip3p -ff amber99sb-ildn
 gmx editconf -f complex_processed.gro -o complex_box.gro -c -d 1.0 -bt cubic
 gmx solvate -cp complex_box.gro -cs spc216.gro -o complex_solv.gro -p topol.top
@@ -233,10 +251,25 @@ gmx grompp -f npt.mdp -c nvt.gro -r nvt.gro -t nvt.cpt -p topol.top -o npt.tpr
 gmx mdrun -v -deffnm npt
 echo "Workflow completed successfully."
 """
+    # NOTE: ions.mdp was previously referenced by run_gromacs.sh but never
+    # generated, which broke the pipeline at the ion-addition step.
+    ions_mdp = """integrator              = steep
+emtol                   = 1000.0
+emstep                  = 0.01
+nsteps                  = 50000
+nstlist                 = 10
+cutoff-scheme           = Verlet
+ns_type                 = grid
+coulombtype             = PME
+rcoulomb                = 1.0
+rvdw                    = 1.0
+pbc                     = xyz
+"""
     return {
         "em.mdp": em_mdp,
         "nvt.mdp": nvt_mdp,
         "npt.mdp": npt_mdp,
+        "ions.mdp": ions_mdp,
         "run_gromacs.sh": run_sh
     }
 

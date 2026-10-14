@@ -22,10 +22,12 @@ def run_docking(
     exhaustiveness: int = 8,
     num_modes: int = 9,
     energy_range: float = 3.0,
-    cpu: int = 0
+    cpu: int = 0,
+    timeout: float = 7200.0
 ):
     """
     Executes AutoDock Vina via CLI binary and returns stdout log and parsed poses.
+    `timeout` (seconds) guards against a hung Vina process blocking forever.
     """
     if not os.path.exists(VINA_BIN):
         raise FileNotFoundError(f"Vina binary not found at {VINA_BIN}")
@@ -48,14 +50,21 @@ def run_docking(
     if cpu > 0:
         cmd.extend(["--cpu", str(cpu)])
 
-    process = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="ignore"
-    )
+    try:
+        process = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=timeout
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"AutoDock Vina timed out after {timeout:.0f} seconds; "
+            "the docking job was terminated. Try a smaller box or lower exhaustiveness."
+        ) from e
 
     if process.returncode != 0:
         raise RuntimeError(f"AutoDock Vina failed with code {process.returncode}:\n{process.stderr}\n{process.stdout}")
@@ -80,7 +89,16 @@ def parse_vina_output(output_pdbqt: str):
     with open(output_pdbqt, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             if line.startswith("MODEL"):
-                mode_num = int(line.split()[1])
+                parts = line.split()
+                if len(parts) < 2:
+                    # Malformed MODEL record (no mode number) — skip instead of crashing
+                    current_pose = None
+                    continue
+                try:
+                    mode_num = int(parts[1])
+                except ValueError:
+                    current_pose = None
+                    continue
                 current_pose = {
                     "mode": mode_num,
                     "affinity": 0.0,

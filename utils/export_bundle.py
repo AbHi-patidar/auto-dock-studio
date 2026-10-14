@@ -7,6 +7,7 @@ and manuscript-ready methods into a single ZIP archive.
 import os
 import zipfile
 import io
+import string
 import pandas as pd
 
 def create_publication_zip(
@@ -33,7 +34,12 @@ def create_publication_zip(
         if os.path.exists(docked_pdbqt_path):
             zf.write(docked_pdbqt_path, arcname="Docked_Poses.pdbqt")
 
-        chosen_pose = docking_poses[chosen_pose_idx] if docking_poses else None
+        # Validate/clamp the requested pose index before indexing docking_poses
+        if docking_poses:
+            chosen_pose_idx = max(0, min(int(chosen_pose_idx), len(docking_poses) - 1))
+            chosen_pose = docking_poses[chosen_pose_idx]
+        else:
+            chosen_pose = None
         if chosen_pose and os.path.exists(clean_receptor_path):
             complex_path = os.path.join(data_dir, f"complex_pose_{chosen_pose['mode']}.pdb")
             with open(complex_path, "w", encoding="utf-8") as out:
@@ -151,12 +157,14 @@ def create_publication_zip(
             zf.writestr("Table_4_Thermodynamic_and_Inhibition_Metrics.csv", interp_table.to_csv(index=False))
 
         # 6. Detailed Experimental Methods & Academic Citations (for direct paste into manuscript)
-        methods_template = """# Molecular Docking & Computational Methods
+        # string.Template is used instead of str.format() so that user-supplied
+        # target/ligand names containing '{...}' cannot raise KeyError.
+        methods_template = string.Template("""# Molecular Docking & Computational Methods
 
 ## 1. Receptor & Ligand Preparation
-The 3D atomic coordinates of the target receptor **{target_name}** were processed by stripping non-catalytic crystallization solvent and buffer salts. Essential catalytic metal ions and structural co-factors were retained with formal charge assignment. Polar hydrogens and AutoDock AD4 atom types were assigned.
+The 3D atomic coordinates of the target receptor **${target_name}** were processed by stripping non-catalytic crystallization solvent and buffer salts. Essential catalytic metal ions and structural co-factors were retained with formal charge assignment. Polar hydrogens and AutoDock AD4 atom types were assigned.
 
-The small molecule ligand **{ligand_name}** was generated from canonical SMILES strings using RDKit's ETKDGv3 distance geometry algorithm, followed by energy minimization with the MMFF94 force field. Partial charges and rotatable bonds were assigned via Meeko to construct the PDBQT representation. Physicochemical drug-likeness was evaluated according to Lipinski's Rule of 5 criteria.
+The small molecule ligand **${ligand_name}** was generated from canonical SMILES strings using RDKit's ETKDGv3 distance geometry algorithm, followed by energy minimization with the MMFF94 force field. Partial charges and rotatable bonds were assigned via Meeko to construct the PDBQT representation. Physicochemical drug-likeness was evaluated according to Lipinski's Rule of 5 criteria.
 
 ## 2. Molecular Docking Protocol
 Flexible-ligand rigid-receptor docking simulations were performed using the AutoDock Vina engine. Search space coordinates and dimensions were centered on the binding cavity with comprehensive exhaustiveness. Binding modes were ranked by calculated binding free energy (ΔG in kcal/mol).
@@ -180,8 +188,8 @@ Protein-ligand complexes were profiled for non-covalent contacts:
 3. **Meeko:** Forli Lab, The Scripps Research Institute. Meeko: Preparation of small molecules for AutoDock. https://github.com/forlilab/Meeko
 4. **3Dmol.js:** Rego, N., & Koes, D. (2015). 3Dmol.js: molecular visualization without Java. Bioinformatics, 31(8), 1322–1324.
 5. **Lipinski's Rule of Five:** Lipinski, C. A., et al. (2001). Experimental and computational approaches to estimate solubility and permeability in drug discovery. Adv. Drug Deliv. Rev., 46(1-3), 3-26.
-"""
-        zf.writestr("Manuscript_Methods_and_Citations.md", methods_template.format(target_name=target_name, ligand_name=ligand_name))
+""")
+        zf.writestr("Manuscript_Methods_and_Citations.md", methods_template.substitute(target_name=target_name, ligand_name=ligand_name))
 
     zip_buffer.seek(0)
     return zip_buffer.getvalue()
