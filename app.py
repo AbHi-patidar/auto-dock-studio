@@ -7,9 +7,16 @@ automated scientific interpretation, and 300 DPI publication figure generation.
 
 import os
 import sys
+import uuid
+import shutil
+import tempfile
+import atexit
+import logging
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+
+logger = logging.getLogger("autodock_studio")
 
 # Add local utils to path
 sys.path.append(os.path.dirname(__file__))
@@ -362,6 +369,64 @@ PRESETS = {
 DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# Per-session working directory: all pipeline intermediates (uploads, PDBQTs,
+# docked poses, figures, PyMOL scripts) live here instead of the shared data/
+# dir, so concurrent users/sessions can never overwrite or read each other's
+# files. The directory is created once per Streamlit session and removed when
+# the server process exits.
+if "session_workdir" not in st.session_state:
+    st.session_state.session_workdir = tempfile.mkdtemp(prefix="autodock_studio_session_")
+
+    def _cleanup_session_dir():
+        try:
+            shutil.rmtree(st.session_state.get("session_workdir", ""), ignore_errors=True)
+        except Exception:
+            pass
+
+    atexit.register(_cleanup_session_dir)
+
+SESSION_DIR = st.session_state.session_workdir
+
+
+# --- Cached expensive computations (fix: Streamlit reruns re-executed them) ---
+# Cache keys include a content/mtime fingerprint so stale results are never reused.
+@st.cache_data(show_spinner=False)
+def cached_profile_interactions(clean_pdb_path: str, receptor_mtime: float, ligand_pdb_text: str):
+    """Non-covalent interaction profiling, cached by receptor + pose."""
+    return profile_interactions(clean_pdb_path, ligand_pdb_text.splitlines(keepends=True))
+
+
+@st.cache_data(show_spinner=False)
+def cached_residue_decomposition(protein_pdb_text: str, ligand_pdb_text: str, cutoff_distance: float = 6.0):
+    """Per-residue energy decomposition, cached by receptor + pose."""
+    return compute_residue_decomposition(
+        protein_pdb_text.splitlines(keepends=True),
+        ligand_pdb_text.splitlines(keepends=True),
+        cutoff_distance=cutoff_distance,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def cached_2d_interaction_diagram(smiles: str, ligand_text: str, interactions: dict, receptor_mtime: float, mode: int):
+    """2D interaction figure (SVG text + PNG bytes), cached by ligand + pose + receptor."""
+    tmpdir = tempfile.mkdtemp(prefix="fig2d_")
+    try:
+        png_path = os.path.join(tmpdir, f"fig2d_{mode}.png")
+        svg_path = os.path.join(tmpdir, f"fig2d_{mode}.svg")
+        generate_2d_interaction_diagram(
+            smiles=smiles,
+            interactions=interactions,
+            output_png_path=png_path,
+            output_svg_path=svg_path,
+        )
+        with open(svg_path, "r", encoding="utf-8") as f:
+            svg_text = f.read()
+        with open(png_path, "rb") as f:
+            png_bytes = f.read()
+        return svg_text, png_bytes
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
 # Academic Sidebar
 with st.sidebar:
     st.markdown("""
@@ -376,7 +441,7 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
     st.markdown("#### 🔬 Computational Bench")
-    st.caption("**Docking Core:** AutoDock Vina v1.2.5 (Scripps Research)")
+    st.caption("**Docking Core:** AutoDock Vina v1.2.7 (Scripps Research)")
     st.caption("**Cheminformatics:** RDKit Release 2023.9+ / Meeko v0.5")
     st.caption("**Dielectric Constant (ε):** 78.5 (Solvent continuum)")
     st.caption("**Standard Temperature (T):** 298.15 K (25.0 °C)")
@@ -516,9 +581,9 @@ if run_1click and is_preset_active:
     with st.spinner(f"Running automated 1-click docking benchmark for {selected_preset_name}..."):
         try:
             # 1. Protein Prep
-            raw_pdb_path = os.path.join(DATA_DIR, f"{preset_data['pdb']}_raw.pdb")
-            clean_pdb_path = os.path.join(DATA_DIR, f"{preset_data['pdb']}_clean.pdb")
-            receptor_pdbqt_path = os.path.join(DATA_DIR, f"{preset_data['pdb']}_receptor.pdbqt")
+            raw_pdb_path = os.path.join(SESSION_DIR, f"{preset_data['pdb']}_raw.pdb")
+            clean_pdb_path = os.path.join(SESSION_DIR, f"{preset_data['pdb']}_clean.pdb")
+            receptor_pdbqt_path = os.path.join(SESSION_DIR, f"{preset_data['pdb']}_receptor.pdbqt")
 
             fetch_pdb_from_rcsb(preset_data["pdb"], raw_pdb_path)
             prep_meta = clean_protein_pdb(raw_pdb_path, clean_pdb_path, preserve_metals=True, preserve_cofactors=True)
@@ -536,7 +601,7 @@ if run_1click and is_preset_active:
             )
 
             # 2. Ligand Prep
-            ligand_pdbqt_path = os.path.join(DATA_DIR, f"{preset_data['name']}.pdbqt")
+            ligand_pdbqt_path = os.path.join(SESSION_DIR, f"{preset_data['name']}.pdbqt")
             prepare_ligand_pdbqt(None, ligand_pdbqt_path, is_smiles=True, smiles_str=preset_data["smiles"])
             st.session_state.ligand_label = preset_data["name"]
             st.session_state.active_smiles = preset_data["smiles"]
@@ -546,7 +611,7 @@ if run_1click and is_preset_active:
             st.session_state.ligand_ready = True
 
             # 3. Docking
-            out_pdbqt = os.path.join(DATA_DIR, f"docked_{preset_data['pdb']}.pdbqt")
+            out_pdbqt = os.path.join(SESSION_DIR, f"docked_{preset_data['pdb']}.pdbqt")
             box_c = preset_data["box"]
             dock_result = run_docking(
                 receptor_pdbqt=receptor_pdbqt_path,
@@ -566,7 +631,10 @@ if run_1click and is_preset_active:
             st.session_state.poses = dock_result["poses"]
             st.session_state.docking_done = True
             st.session_state.selected_pose_idx = 0
-            st.success(f"Benchmark finished! Found {len(dock_result['poses'])} valid binding poses with top affinity ΔG = {dock_result['poses'][0]['affinity']} kcal/mol.")
+            if dock_result["poses"]:
+                st.success(f"Benchmark finished! Found {len(dock_result['poses'])} valid binding poses with top affinity ΔG = {dock_result['poses'][0]['affinity']} kcal/mol.")
+            else:
+                st.warning("Benchmark finished, but Vina returned no binding poses. Check the ligand preparation, receptor, or grid box placement.")
             st.rerun()
 
         except Exception as e:
@@ -581,6 +649,23 @@ studio_mode = st.radio(
     ],
     horizontal=True
 )
+
+# Reset cross-mode session state when switching protocols so stale results
+# from one mode are never displayed in the other.
+_previous_mode = st.session_state.get("studio_mode_value")
+if _previous_mode is not None and _previous_mode != studio_mode:
+    if studio_mode.startswith("⚡"):
+        # Entering HTVS batch mode: clear single-docking state
+        st.session_state.poses = []
+        st.session_state.docking_done = False
+        st.session_state.selected_pose_idx = 0
+        st.session_state.validation_result = None
+        st.session_state.interpretation_data = {}
+    else:
+        # Entering single-docking mode: clear batch screening state
+        st.session_state.screening_results = None
+st.session_state.studio_mode_value = studio_mode
+
 st.markdown("---")
 
 if studio_mode == "⚡ High-Throughput Virtual Screening (HTVS & Batch Docking)":
@@ -658,9 +743,9 @@ if studio_mode == "⚡ High-Throughput Virtual Screening (HTVS & Batch Docking)"
                 pdb_key = "1M17"
                 grid_p = {"center_x": 22.0, "center_y": 0.3, "center_z": 52.8, "size_x": 22.0, "size_y": 22.0, "size_z": 22.0}
 
-            raw_p = os.path.join(DATA_DIR, f"{pdb_key}_raw.pdb")
-            clean_p = os.path.join(DATA_DIR, f"{pdb_key}_clean.pdb")
-            rec_path = os.path.join(DATA_DIR, f"{pdb_key}_receptor.pdbqt")
+            raw_p = os.path.join(SESSION_DIR, f"{pdb_key}_raw.pdb")
+            clean_p = os.path.join(SESSION_DIR, f"{pdb_key}_clean.pdb")
+            rec_path = os.path.join(SESSION_DIR, f"{pdb_key}_receptor.pdbqt")
             fetch_pdb_from_rcsb(pdb_key, raw_p)
             clean_protein_pdb(raw_p, clean_p)
             receptor_pdb_to_pdbqt(clean_p, rec_path)
@@ -734,10 +819,15 @@ with col_left:
     if st.button("🔧 Prepare Receptor (Auto-clean & PDBQT)", use_container_width=True):
         with st.spinner("Downloading PDB, stripping solvent, adding polar hydrogens, computing charges..."):
             try:
-                raw_pdb_path = os.path.join(DATA_DIR, "receptor_raw.pdb")
+                raw_pdb_path = os.path.join(SESSION_DIR, "receptor_raw.pdb")
                 if uploaded_pdb is not None:
+                    # Cap upload size before reading the whole file into memory
+                    uploaded_bytes = uploaded_pdb.getbuffer()
+                    if len(uploaded_bytes) > 50 * 1024 * 1024:
+                        st.error("Uploaded PDB exceeds the 50 MB size limit.")
+                        st.stop()
                     with open(raw_pdb_path, "wb") as f:
-                        f.write(uploaded_pdb.getbuffer())
+                        f.write(uploaded_bytes)
                     target_label = uploaded_pdb.name
                 elif pdb_id_input.strip():
                     fetch_pdb_from_rcsb(pdb_id_input.strip(), raw_pdb_path)
@@ -746,7 +836,7 @@ with col_left:
                     st.error("Please enter a PDB ID or upload a .pdb file.")
                     st.stop()
 
-                clean_pdb_path = os.path.join(DATA_DIR, "receptor_clean.pdb")
+                clean_pdb_path = os.path.join(SESSION_DIR, "receptor_clean.pdb")
                 prep_meta = clean_protein_pdb(
                     raw_pdb_path,
                     clean_pdb_path,
@@ -754,7 +844,7 @@ with col_left:
                     preserve_cofactors=preserve_cofactors
                 )
 
-                receptor_pdbqt_path = os.path.join(DATA_DIR, "receptor.pdbqt")
+                receptor_pdbqt_path = os.path.join(SESSION_DIR, "receptor.pdbqt")
                 receptor_pdb_to_pdbqt(clean_pdb_path, receptor_pdbqt_path)
 
                 st.session_state.target_label = target_label
@@ -806,6 +896,14 @@ with col_left:
             <button onclick="loadSketcherTemplate('CC(C)Cc1ccc(cc1)C(C)C(=O)O')" style="background:#f1f5f9; border:1px solid #cbd5e1; border-radius:4px; padding:3px 8px; font-size:11px; cursor:pointer;">Ibuprofen</button>
             <button onclick="loadSketcherTemplate('COCCOc1cc2c(cc1OCCOC)ncnc2Nc3cccc(c3)C#C')" style="background:#f1f5f9; border:1px solid #cbd5e1; border-radius:4px; padding:3px 8px; font-size:11px; cursor:pointer;">Erlotinib</button>
         </div>
+        <!--
+          NOTE: the JSME sketcher is loaded from a third-party CDN at runtime.
+          If the CDN is down or compromised, the sketcher breaks or runs
+          attacker-controlled JS inside the app page. Vendoring the JSME bundle
+          locally (jsme.nocache.js + resources) was considered but skipped: the
+          bundle is several MB and would bloat the repository. Revisit this
+          trade-off before any multi-user / public deployment.
+        -->
         <script type="text/javascript" src="https://jsme-editor.github.io/dist/jsme/jsme.nocache.js"></script>
         <script>
         function jsmeOnLoad() {
@@ -841,9 +939,14 @@ with col_left:
     if st.button("🧪 Prepare Ligand & Drug-Likeness", use_container_width=True):
         with st.spinner("Generating 3D conformer (ETKDGv3), minimizing energy (MMFF94)..."):
             try:
-                ligand_pdbqt_path = os.path.join(DATA_DIR, "ligand.pdbqt")
+                ligand_pdbqt_path = os.path.join(SESSION_DIR, "ligand.pdbqt")
                 if uploaded_lig is not None:
-                    temp_lig_path = os.path.join(DATA_DIR, uploaded_lig.name)
+                    # Never trust the client-provided filename (path traversal):
+                    # use a generated name, keeping only the original extension.
+                    _ext = os.path.splitext(uploaded_lig.name)[1].lower()
+                    if _ext not in (".sdf", ".mol", ".pdb"):
+                        _ext = ".sdf"
+                    temp_lig_path = os.path.join(SESSION_DIR, f"ligand_upload_{uuid.uuid4().hex}{_ext}")
                     with open(temp_lig_path, "wb") as f:
                         f.write(uploaded_lig.getbuffer())
                     prepare_ligand_pdbqt(temp_lig_path, ligand_pdbqt_path)
@@ -940,7 +1043,7 @@ with col_left:
     if st.button("🚀 Execute Autonomous Molecular Docking", use_container_width=True, disabled=not ready_to_dock):
         with st.spinner("Executing AutoDock Vina engine and computing binding affinities..."):
             try:
-                out_pdbqt = os.path.join(DATA_DIR, "docked_output.pdbqt")
+                out_pdbqt = os.path.join(SESSION_DIR, "docked_output.pdbqt")
                 dock_result = run_docking(
                     receptor_pdbqt=st.session_state.receptor_pdbqt_path,
                     ligand_pdbqt=st.session_state.ligand_pdbqt_path,
@@ -1003,15 +1106,24 @@ with col_right:
         pose_options = [f"Pose {p['mode']} (Affinity: {p['affinity']} kcal/mol, RMSD: {p['rmsd_lb']} Å)" for p in poses]
         selected_pose_str = st.selectbox("Select Docked Binding Mode", pose_options, index=st.session_state.selected_pose_idx)
         selected_mode_num = int(selected_pose_str.split()[1])
-        st.session_state.selected_pose_idx = selected_mode_num - 1
-
-        chosen_pose = poses[st.session_state.selected_pose_idx]
+        # Map by the pose's own `mode` value instead of assuming mode - 1 is a
+        # valid positional index (models may be non-sequential).
+        chosen_pose = next((p for p in poses if p["mode"] == selected_mode_num), None)
+        if chosen_pose is None:
+            st.warning(f"Selected mode {selected_mode_num} was not found in the docking results; showing the first pose.")
+            chosen_pose = poses[0]
+        st.session_state.selected_pose_idx = poses.index(chosen_pose)
         current_affinity = f"{chosen_pose['affinity']} kcal/mol"
         current_rmsd = f"{chosen_pose['rmsd_lb']} Å"
         active_lig_str = "".join(chosen_pose["pdb_lines"])
 
         # Compute real-time non-covalent interactions (replaces PyMOL)
-        interactions_data = profile_interactions(st.session_state.clean_pdb_path, chosen_pose["pdb_lines"])
+        receptor_mtime = os.path.getmtime(st.session_state.clean_pdb_path) if os.path.exists(st.session_state.clean_pdb_path) else 0.0
+        interactions_data = cached_profile_interactions(
+            st.session_state.clean_pdb_path,
+            receptor_mtime,
+            "".join(chosen_pose["pdb_lines"]),
+        )
 
         # Automated Scientific Interpretation Calculation
         heavy_atoms = st.session_state.get("ligand_summary", {}).get("num_atoms", 30)
@@ -1128,17 +1240,23 @@ with col_right:
                 st.code(enriched_manuscript, language="markdown")
 
         # Tab 2: 2D Diagram
-        fig_2d_png = os.path.join(DATA_DIR, f"Figure_2_2D_pose_{chosen_pose['mode']}.png")
-        fig_2d_svg = os.path.join(DATA_DIR, f"Figure_2_2D_pose_{chosen_pose['mode']}.svg")
+        fig_2d_png = os.path.join(SESSION_DIR, f"Figure_2_2D_pose_{chosen_pose['mode']}.png")
+        fig_2d_svg = os.path.join(SESSION_DIR, f"Figure_2_2D_pose_{chosen_pose['mode']}.svg")
         try:
-            generate_2d_interaction_diagram(
+            _svg_text, _png_bytes = cached_2d_interaction_diagram(
                 smiles=st.session_state.active_smiles,
+                ligand_text=active_lig_str,
                 interactions=interactions_data,
-                output_png_path=fig_2d_png,
-                output_svg_path=fig_2d_svg
+                receptor_mtime=receptor_mtime,
+                mode=chosen_pose["mode"],
             )
+            with open(fig_2d_png, "wb") as f:
+                f.write(_png_bytes)
+            with open(fig_2d_svg, "w", encoding="utf-8") as f:
+                f.write(_svg_text)
             has_2d_fig = True
         except Exception:
+            logger.exception("2D interaction diagram generation failed; continuing without it.")
             has_2d_fig = False
 
         with tab_2d:
@@ -1164,8 +1282,8 @@ with col_right:
             with st.spinner("Computing per-residue Lennard-Jones & Coulombic energy decomposition..."):
                 try:
                     with open(st.session_state.clean_pdb_path, "r", encoding="utf-8", errors="ignore") as f:
-                        prot_lines = f.readlines()
-                    decomp_df = compute_residue_decomposition(prot_lines, chosen_pose["pdb_lines"], cutoff_distance=5.5)
+                        prot_text = f.read()
+                    decomp_df = cached_residue_decomposition(prot_text, "".join(chosen_pose["pdb_lines"]), cutoff_distance=5.5)
                     
                     if not decomp_df.empty:
                         plot_fig = generate_decomposition_plot(decomp_df, top_n=15)
@@ -1357,9 +1475,9 @@ with col_right:
             st.markdown("#### § 7. Crystallographic Re-docking & RMSD Protocol Validation")
             st.caption("Peer-reviewed validation benchmark: Calculates heavy-atom Root Mean Square Deviation (RMSD) between the docked pose and experimental co-crystallized coordinates (Gold-standard criteria: RMSD <= 2.0 Å).")
             
-            raw_path = os.path.join(DATA_DIR, f"{st.session_state.get('target_label', 'receptor')}_raw.pdb")
+            raw_path = os.path.join(SESSION_DIR, f"{st.session_state.get('target_label', 'receptor')}_raw.pdb")
             if not os.path.exists(raw_path):
-                raw_path = os.path.join(DATA_DIR, "receptor_raw.pdb")
+                raw_path = os.path.join(SESSION_DIR, "receptor_raw.pdb")
                 
             detected_ligands = st.session_state.get("protein_meta", {}).get("detected_ligands", {})
             default_lig_id = list(detected_ligands.keys())[0] if detected_ligands else "MK1"
@@ -1375,7 +1493,7 @@ with col_right:
             if run_rmsd_check or st.session_state.get("validation_result"):
                 if os.path.exists(raw_path):
                     try:
-                        native_pdb = os.path.join(DATA_DIR, f"native_{crystal_lig_name}.pdb")
+                        native_pdb = os.path.join(SESSION_DIR, f"native_{crystal_lig_name}.pdb")
                         extract_native_ligand_pdb(raw_path, crystal_lig_name, native_pdb)
                         with open(native_pdb, "r", encoding="utf-8", errors="ignore") as f:
                             crystal_lines = f.readlines()
@@ -1448,8 +1566,8 @@ with col_right:
             st.write("#### 📦 One-Click Publication Submission Package")
             st.write("Generates a zipped package containing 300 DPI figures, vector SVGs, data tables, scientific interpretation, PDB complex, PyMOL PML script, and manuscript text.")
 
-            pml_path = os.path.join(DATA_DIR, "session.pml")
-            complex_pdb_path = os.path.join(DATA_DIR, f"complex_pose_{chosen_pose['mode']}.pdb")
+            pml_path = os.path.join(SESSION_DIR, "session.pml")
+            complex_pdb_path = os.path.join(SESSION_DIR, f"complex_pose_{chosen_pose['mode']}.pdb")
             create_complex_pdb(st.session_state.clean_pdb_path, chosen_pose["pdb_lines"], complex_pdb_path)
             generate_pymol_script(complex_pdb_path, interactions_data["pocket_residues"], pml_path)
 
@@ -1458,7 +1576,7 @@ with col_right:
                 interp_data["manuscript_draft"] = append_advanced_scenario_to_manuscript(interp_data.get("manuscript_draft", ""), st.session_state.get("active_scenarios", []))
 
             zip_bytes = create_publication_zip(
-                data_dir=DATA_DIR,
+                data_dir=SESSION_DIR,
                 target_name=st.session_state.get("target_label", "Receptor"),
                 ligand_name=st.session_state.get("ligand_label", "Ligand"),
                 docking_poses=st.session_state.poses,
