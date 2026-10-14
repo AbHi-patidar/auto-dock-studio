@@ -1,11 +1,15 @@
-streamlit>=1.30.0
-rdkit>=2023.9.1
-meeko>=0.5.0
-scipy>=1.10.0
-gemmi>=0.7.0
-pandas>=2.0.0
-numpy>=1.24.0
-Pillow>=10.0.0
-requests>=2.31.0
-plotly>=5.18.0
-
+# AutoDock Studio — pinned dependency versions.
+# Pins are chosen to be mutually compatible with the code as written
+# (rdkit 2023.9.x + numpy 1.26.x, meeko 0.6.x with the PDBQTWriterLegacy API).
+# Regenerate with `pip freeze` after any deliberate upgrade.
+streamlit==1.32.0
+rdkit==2023.9.5
+meeko==0.6.0
+scipy==1.11.4
+gemmi==0.7.0
+pandas==2.1.4
+numpy==1.26.3
+Pillow==10.2.0
+requests==2.31.0
+plotly==5.18.0
+pytest==7.4.4
