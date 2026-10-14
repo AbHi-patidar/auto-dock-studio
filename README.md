@@ -1,6 +1,8 @@
 # 🧬 AutoDock Studio: Autonomous Molecular Docking & Publication Studio
 
-**AutoDock Studio** is a complete, zero-install computational drug discovery and structural biology platform. It eliminates the manual bottlenecks of **AutoDockTools** / MGLTools and **PyMOL**, delivering **publication-ready figures and submission bundles** directly from your web browser.
+**AutoDock Studio** is a complete computational drug discovery and structural biology platform. It eliminates the manual bottlenecks of **AutoDockTools** / MGLTools and **PyMOL**, delivering **publication-ready figures and submission bundles** directly from your web browser.
+
+> ⚠️ **Platform requirement:** AutoDock Studio is currently **Windows-only**. It ships the Windows binaries `bin/vina.exe` / `bin/vina_split.exe` (AutoDock Vina 1.2.7), launches via `run.bat`, and several figure-rendering paths assume Windows system fonts. Linux/macOS support is planned but not yet implemented — see [Platform Roadmap](#-platform-roadmap) below.
 
 ---
 
@@ -11,7 +13,7 @@
 - **Automated Solvent & Salt Stripping:** Removes crystallographic waters (`HOH`), crystallization buffers (`SO4`, `PO4`, `PEG`), and cryoprotectants.
 - **Catalytic Metal Ion Retention:** Keeps essential catalytic metals (`Zn²⁺`, `Mg²⁺`, `Fe²⁺/Fe³⁺`, `Ca²⁺`, `Mn²⁺`, `Cu²⁺`) and cofactors (`HEM`, `NAD`, `FAD`, `ATP`) with proper formal charges for accurate metalloenzyme docking.
 - **Binding Pocket Identification:** Automatically detects co-crystallized small molecules and calculates active site coordinates.
-- **PDBQT Generation:** Assigns polar hydrogens, Kollman/Gasteiger charges, and AutoDock atom types.
+- **PDBQT Generation:** Assigns polar hydrogens, heuristic partial charges (fixed per-element / AutoDock AD4-type scheme: C +0.100, N −0.350/−0.400, O −0.550, S −0.200, H +0.350, catalytic metals +2.0 — *not* computed Gasteiger charges), and AutoDock atom types.
 - **Special Scenario Auto-Detection:** Automatically scans structures for metalloenzyme centers, covalent reactive residues, disulfide bonds, and multi-chain protein-protein interfaces.
 
 ### 2. Autonomous Ligand Preparation & Drug-Likeness
@@ -93,3 +95,16 @@ Select from the top dropdown and click **"⚡ Execute Validation Benchmark in 1-
 - **SARS-CoV-2 Mpro (`6LU7`) + Nirmatrelvir** (Paxlovid active ingredient)
 - **EGFR Kinase (`1M17`) + Erlotinib** (Cancer therapeutic)
 - **Human Serum Albumin (`1AO6`) + Ibuprofen** (NSAID transport model)
+
+---
+
+## 🖥️ Platform Roadmap
+
+- **Supported today:** Windows 10/11 (64-bit). The docking engine is the bundled `bin/vina.exe` (AutoDock Vina 1.2.7); 2D figures prefer Windows system fonts (Segoe UI/Arial) and fall back to a bitmap font elsewhere.
+- **Not yet supported:** Linux and macOS — the app will fail at docking time because no Linux/macOS Vina binary is bundled or selected. Cross-platform binaries plus launcher selection (`VINA_BIN` per platform) are planned.
+
+### 3. Running the Test Suite (developers)
+```bash
+pip install -r requirements.txt
+python -m pytest test_pipeline.py -v          # fast offline unit tests (integration skipped)
+```
