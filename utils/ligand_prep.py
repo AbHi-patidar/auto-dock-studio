@@ -6,9 +6,13 @@ Supports both local RDKit and NIH Cactus / PubChem online 3D coordinate generati
 
 import os
 import sys
+import logging
+import tempfile
 import urllib.parse
 import urllib.request
 import re
+
+logger = logging.getLogger("autodock_studio")
 
 def fetch_3d_sdf_from_cactus(smiles: str, output_sdf_path: str):
     """
@@ -49,16 +53,20 @@ def smiles_to_3d_mol(smiles: str, name: str = "ligand"):
         try:
             AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
         except Exception:
+            logger.warning("MMFF94 minimization failed for '%s'; trying UFF.", name)
             try:
                 AllChem.UFFOptimizeMolecule(mol, maxIters=500)
             except Exception:
-                pass
+                logger.exception("UFF minimization also failed; using the unminimized ETKDG conformer.")
 
         return mol
 
     except ImportError:
-        # Fallback to NIH Cactus SDF if local RDKit is not installed
-        temp_sdf = os.path.join(os.path.dirname(__file__), "..", "data", "temp_ligand.sdf")
+        # Fallback to NIH Cactus SDF if local RDKit is not installed.
+        # Use a unique temp file (never a fixed shared name) so concurrent
+        # sessions cannot overwrite each other's ligands.
+        fd, temp_sdf = tempfile.mkstemp(prefix="ligand_cactus_", suffix=".sdf")
+        os.close(fd)
         fetch_3d_sdf_from_cactus(smiles, temp_sdf)
         return temp_sdf
 
@@ -89,40 +97,39 @@ def prepare_ligand_pdbqt(mol_or_file, output_pdbqt_path: str, is_smiles: bool = 
         else:
             mol = mol_or_file
 
-        from meeko import MoleculePreparation
+        from meeko import MoleculePreparation, PDBQTWriterLegacy
         preparator = MoleculePreparation()
         mol_setups = preparator.prepare(mol)
-        
-        try:
-            from meeko import PDBQTWriterLegacy
-            res = PDBQTWriterLegacy.write_string(mol_setups[0])
-            if isinstance(res, (tuple, list)):
-                pdbqt_string = res[0]
-            else:
-                pdbqt_string = str(res)
-        except Exception:
-            try:
-                res = preparator.write_pdbqt_string()
-                pdbqt_string = res[0] if isinstance(res, (tuple, list)) else str(res)
-            except Exception:
-                from meeko import write_pdbqt_string
-                res = write_pdbqt_string(mol_setups[0])
-                pdbqt_string = res[0] if isinstance(res, (tuple, list)) else str(res)
+
+        # Single Meeko code path, pinned to meeko==0.6.0 (see requirements.txt).
+        # Older nested try/except fallbacks across three different Meeko APIs
+        # masked real preparation errors; they are intentionally removed.
+        res = PDBQTWriterLegacy.write_string(mol_setups[0])
+        if isinstance(res, (tuple, list)):
+            pdbqt_string = res[0]
+        else:
+            pdbqt_string = str(res)
+        logger.info("Ligand PDBQT prepared with the Meeko backend (meeko==0.6.0).")
 
         with open(output_pdbqt_path, "w", encoding="utf-8") as f:
             f.write(pdbqt_string)
 
         return output_pdbqt_path
 
-    except Exception:
+    except Exception as e:
+        logger.warning("Meeko/RDKit ligand preparation failed (%s); trying RDKit-direct fallback.", e)
         # 2. Local RDKit direct PDBQT fallback (no external network or meeko required)
         if mol is not None:
             try:
-                return _rdkit_mol_to_pdbqt(mol, output_pdbqt_path)
+                result = _rdkit_mol_to_pdbqt(mol, output_pdbqt_path)
+                logger.info("Ligand PDBQT prepared with the RDKit-direct fallback backend.")
+                return result
             except Exception:
-                pass
+                logger.exception("RDKit-direct fallback failed; trying standalone SDF parser.")
         # 3. Standalone fallback parser (works with SDF file directly)
-        return _standalone_sdf_to_pdbqt(mol_or_file, output_pdbqt_path, is_smiles, smiles_str)
+        result = _standalone_sdf_to_pdbqt(mol_or_file, output_pdbqt_path, is_smiles, smiles_str)
+        logger.info("Ligand PDBQT prepared with the standalone SDF fallback backend.")
+        return result
 
 def _rdkit_mol_to_pdbqt(mol, output_pdbqt_path: str):
     """Fallback generator converting an RDKit Mol with 3D coordinates into a valid PDBQT."""
@@ -216,75 +223,87 @@ def _standalone_sdf_to_pdbqt(mol_or_file, output_pdbqt_path: str, is_smiles: boo
     and torsion metadata without requiring external C-extensions.
     """
     sdf_path = mol_or_file
+    cleanup_sdf = False
     if is_smiles or (isinstance(mol_or_file, str) and not os.path.exists(mol_or_file)):
-        sdf_path = os.path.join(os.path.dirname(output_pdbqt_path), "cactus_3d.sdf")
+        # Unique temp file (never a fixed shared name) so concurrent sessions
+        # cannot collide; deleted in the finally block below.
+        fd, sdf_path = tempfile.mkstemp(prefix="cactus_3d_", suffix=".sdf")
+        os.close(fd)
+        cleanup_sdf = True
         query_smiles = smiles_str if smiles_str else str(mol_or_file)
         fetch_3d_sdf_from_cactus(query_smiles, sdf_path)
 
-    atoms = []
-    # Read V2000 SDF
-    with open(sdf_path, "r", encoding="utf-8", errors="ignore") as f:
-        lines = f.readlines()
+    try:
+        atoms = []
+        # Read V2000 SDF
+        with open(sdf_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
 
-    atom_count = 0
-    bond_count = 0
-    # Line 4 contains counts: aaabbblll...
-    for i, line in enumerate(lines):
-        if "V2000" in line:
+        atom_count = 0
+        bond_count = 0
+        # Line 4 contains counts: aaabbblll...
+        for i, line in enumerate(lines):
+            if "V2000" in line:
+                try:
+                    atom_count = int(line[:3].strip())
+                    bond_count = int(line[3:6].strip())
+                except ValueError:
+                    pass
+                atom_start = i + 1
+                break
+        else:
+            atom_start = 4
+
+        pdbqt_lines = ["ROOT\n"]
+        for idx in range(atom_count):
+            line = lines[atom_start + idx]
             try:
-                atom_count = int(line[:3].strip())
-                bond_count = int(line[3:6].strip())
-            except ValueError:
-                pass
-            atom_start = i + 1
-            break
-    else:
-        atom_start = 4
+                x = float(line[:10].strip())
+                y = float(line[10:20].strip())
+                z = float(line[20:30].strip())
+                elem = line[31:34].strip()
+            except (ValueError, IndexError):
+                continue
 
-    pdbqt_lines = ["ROOT\n"]
-    for idx in range(atom_count):
-        line = lines[atom_start + idx]
-        try:
-            x = float(line[:10].strip())
-            y = float(line[10:20].strip())
-            z = float(line[20:30].strip())
-            elem = line[31:34].strip()
-        except (ValueError, IndexError):
-            continue
-
-        ad_type = elem
-        charge = 0.000
-        if elem == "O":
-            ad_type = "OA"
-            charge = -0.500
-        elif elem == "N":
-            ad_type = "NA"
-            charge = -0.350
-        elif elem == "C":
-            ad_type = "C"
-            charge = 0.050
-        elif elem == "H":
-            ad_type = "HD"
-            charge = 0.200
-        elif elem in ("F", "Cl", "Br", "I"):
             ad_type = elem
-            charge = -0.150
+            charge = 0.000
+            if elem == "O":
+                ad_type = "OA"
+                charge = -0.500
+            elif elem == "N":
+                ad_type = "NA"
+                charge = -0.350
+            elif elem == "C":
+                ad_type = "C"
+                charge = 0.050
+            elif elem == "H":
+                ad_type = "HD"
+                charge = 0.200
+            elif elem in ("F", "Cl", "Br", "I"):
+                ad_type = elem
+                charge = -0.150
 
-        atom_name = f"{elem}{idx+1}"[:4].ljust(4)
-        formatted = (
-            f"HETATM{idx+1:5d} {atom_name} LIG A   1    "
-            f"{x:8.3f}{y:8.3f}{z:8.3f}"
-            f"  1.00 20.00    {charge:+6.3f} {ad_type:<2s}\n"
-        )
-        pdbqt_lines.append(formatted)
+            atom_name = f"{elem}{idx+1}"[:4].ljust(4)
+            formatted = (
+                f"HETATM{idx+1:5d} {atom_name} LIG A   1    "
+                f"{x:8.3f}{y:8.3f}{z:8.3f}"
+                f"  1.00 20.00    {charge:+6.3f} {ad_type:<2s}\n"
+            )
+            pdbqt_lines.append(formatted)
 
-    pdbqt_lines.append("ENDROOT\n")
-    pdbqt_lines.append("TORSDOF 5\n")
+        pdbqt_lines.append("ENDROOT\n")
+        pdbqt_lines.append("TORSDOF 5\n")
 
-    with open(output_pdbqt_path, "w", encoding="utf-8") as f:
-        f.writelines(pdbqt_lines)
+        with open(output_pdbqt_path, "w", encoding="utf-8") as f:
+            f.writelines(pdbqt_lines)
 
-    return output_pdbqt_path
+        return output_pdbqt_path
+    finally:
+        if cleanup_sdf:
+            try:
+                os.remove(sdf_path)
+            except OSError:
+                pass
 
 def get_ligand_summary(pdbqt_path: str):
     """Returns basic atom count, molecular center, and bounding box of prepared ligand."""

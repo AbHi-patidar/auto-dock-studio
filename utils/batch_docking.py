@@ -6,11 +6,26 @@ Lipophilic Ligand Efficiency (LLE), and generates ranked hit leaderboards.
 
 import os
 import math
+import re
+import shutil
+import logging
 import tempfile
 import pandas as pd
 from typing import List, Dict, Callable, Optional
 from rdkit import Chem
 from rdkit.Chem import Descriptors, Crippen
+
+logger = logging.getLogger("autodock_studio")
+
+# Batch-screening safety limits
+MAX_LIBRARY_COMPOUNDS = 2000  # hard cap: larger libraries are refused
+LARGE_LIBRARY_WARNING = 200   # soft cap: warn about expected compute time
+
+
+def _sanitize_compound_name(name: str, idx: int) -> str:
+    """Restricts compound names to [A-Za-z0-9_-] so they are safe in temp paths."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", str(name)).strip("_") or f"CMPD_{idx+1:03d}"
+    return safe[:64]
 
 try:
     from utils.ligand_prep import prepare_ligand_from_smiles
@@ -110,8 +125,21 @@ def run_batch_virtual_screening(
     results = []
     total = len(compounds)
 
+    if total > MAX_LIBRARY_COMPOUNDS:
+        raise ValueError(
+            f"Library of {total} compounds exceeds the safety cap of "
+            f"{MAX_LIBRARY_COMPOUNDS}. Split the library into smaller batches "
+            "or increase MAX_LIBRARY_COMPOUNDS in utils/batch_docking.py."
+        )
+    if total > LARGE_LIBRARY_WARNING:
+        logger.warning(
+            "Screening %d compounds serially (minutes per compound); "
+            "expected runtime is on the order of days. Consider a smaller library.",
+            total
+        )
+
     for i, cmpd in enumerate(compounds):
-        name = cmpd["name"]
+        name = _sanitize_compound_name(cmpd["name"], i)
         smiles = cmpd["smiles"]
 
         if progress_callback:
@@ -157,6 +185,7 @@ def run_batch_virtual_screening(
         try:
             prepare_ligand_from_smiles(smiles, lig_pdbqt_path)
         except Exception as e:
+            shutil.rmtree(temp_dir, ignore_errors=True)  # no temp-dir leak on prep failure
             results.append({
                 "Rank": i + 1,
                 "Compound": name,
@@ -175,66 +204,72 @@ def run_batch_virtual_screening(
             continue
 
         # 3. AutoDock Vina Execution
+        # The temp dir is removed in the finally block whether docking
+        # succeeds or fails (the Pose_PDBQT path is retained in the results
+        # table for reference only; nothing on disk is needed downstream).
         try:
-            dock_res = run_docking(
-                receptor_pdbqt=receptor_pdbqt_path,
-                ligand_pdbqt=lig_pdbqt_path,
-                output_pdbqt=docked_out_path,
-                center_x=grid_params["center_x"],
-                center_y=grid_params["center_y"],
-                center_z=grid_params["center_z"],
-                size_x=grid_params["size_x"],
-                size_y=grid_params["size_y"],
-                size_z=grid_params["size_z"],
-                exhaustiveness=exhaustiveness,
-                num_modes=num_modes
-            )
-            docked_poses = dock_res.get("poses", [])
-            if not docked_poses:
-                raise ValueError("No docked modes returned by Vina")
+            try:
+                dock_res = run_docking(
+                    receptor_pdbqt=receptor_pdbqt_path,
+                    ligand_pdbqt=lig_pdbqt_path,
+                    output_pdbqt=docked_out_path,
+                    center_x=grid_params["center_x"],
+                    center_y=grid_params["center_y"],
+                    center_z=grid_params["center_z"],
+                    size_x=grid_params["size_x"],
+                    size_y=grid_params["size_y"],
+                    size_z=grid_params["size_z"],
+                    exhaustiveness=exhaustiveness,
+                    num_modes=num_modes
+                )
+                docked_poses = dock_res.get("poses", [])
+                if not docked_poses:
+                    raise ValueError("No docked modes returned by Vina")
 
-            best_affinity = docked_poses[0]["affinity"]
-            
-            # Estimated Ki: Ki = exp(DeltaG / RT)
-            # R = 1.9872e-3 kcal/(mol*K), T = 298.15 K -> RT = 0.5925 kcal/mol
-            rt = 0.5925
-            ki_molar = math.exp(best_affinity / rt)
-            ki_nm = round(ki_molar * 1e9, 1)
+                best_affinity = docked_poses[0]["affinity"]
 
-            le = calculate_ligand_efficiency(best_affinity, heavy_atoms)
-            lle = calculate_lle(best_affinity, logp)
+                # Estimated Ki: Ki = exp(DeltaG / RT)
+                # R = 1.9872e-3 kcal/(mol*K), T = 298.15 K -> RT = 0.5925 kcal/mol
+                rt = 0.5925
+                ki_molar = math.exp(best_affinity / rt)
+                ki_nm = round(ki_molar * 1e9, 1)
 
-            results.append({
-                "Rank": 0,  # Will be assigned after sort
-                "Compound": name,
-                "SMILES": smiles,
-                "Status": "Success",
-                "Affinity_kcal": best_affinity,
-                "Est_Ki_nM": ki_nm,
-                "LE": le,
-                "LLE": lle,
-                "MW": mw,
-                "LogP": logp,
-                "Lipinski_Violations": lipinski_viol,
-                "PAINS_Alerts": pains_count,
-                "Pose_PDBQT": docked_out_path
-            })
-        except Exception as e:
-            results.append({
-                "Rank": i + 1,
-                "Compound": name,
-                "SMILES": smiles,
-                "Status": f"Docking Failed ({str(e)[:30]})",
-                "Affinity_kcal": None,
-                "Est_Ki_nM": None,
-                "LE": None,
-                "LLE": None,
-                "MW": mw,
-                "LogP": logp,
-                "Lipinski_Violations": lipinski_viol,
-                "PAINS_Alerts": pains_count,
-                "Pose_PDBQT": None
-            })
+                le = calculate_ligand_efficiency(best_affinity, heavy_atoms)
+                lle = calculate_lle(best_affinity, logp)
+
+                results.append({
+                    "Rank": 0,  # Will be assigned after sort
+                    "Compound": name,
+                    "SMILES": smiles,
+                    "Status": "Success",
+                    "Affinity_kcal": best_affinity,
+                    "Est_Ki_nM": ki_nm,
+                    "LE": le,
+                    "LLE": lle,
+                    "MW": mw,
+                    "LogP": logp,
+                    "Lipinski_Violations": lipinski_viol,
+                    "PAINS_Alerts": pains_count,
+                    "Pose_PDBQT": docked_out_path
+                })
+            except Exception as e:
+                results.append({
+                    "Rank": i + 1,
+                    "Compound": name,
+                    "SMILES": smiles,
+                    "Status": f"Docking Failed ({str(e)[:30]})",
+                    "Affinity_kcal": None,
+                    "Est_Ki_nM": None,
+                    "LE": None,
+                    "LLE": None,
+                    "MW": mw,
+                    "LogP": logp,
+                    "Lipinski_Violations": lipinski_viol,
+                    "PAINS_Alerts": pains_count,
+                    "Pose_PDBQT": None
+                })
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     # Sort successful hits by binding affinity (most negative first)
     df = pd.DataFrame(results)

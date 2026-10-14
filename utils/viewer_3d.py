@@ -23,8 +23,16 @@ def generate_3dmol_html(
     """
     grid_json = json.dumps(grid_box or {})
     interactions_json = json.dumps(interactions or {})
-    rec_escaped = receptor_pdb_content.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
-    lig_escaped = ligand_pdb_content.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
+
+    def _js_safe_string(value: str) -> str:
+        # Inject PDB text as a JSON-quoted JS string literal (not a template
+        # literal). json.dumps neutralizes quotes/backslashes, and the extra
+        # '<' -> \u003c step prevents a '</script>' sequence in user-uploaded
+        # PDB REMARK records from breaking out of the <script> block (XSS).
+        return json.dumps(value).replace("<", "\\u003c")
+
+    rec_json_str = _js_safe_string(receptor_pdb_content)
+    lig_json_str = _js_safe_string(ligand_pdb_content)
 
     bg_color = "#ffffff" if publication_mode else "#0b1120"
     panel_bg = "rgba(255, 255, 255, 0.95)" if publication_mode else "rgba(15, 23, 42, 0.88)"
@@ -165,8 +173,8 @@ def generate_3dmol_html(
 
   <script>
     let viewer = null;
-    const recPdb = `__REC_PDB__`;
-    const ligPdb = `__LIG_PDB__`;
+    const recPdb = __REC_PDB_JSON__;
+    const ligPdb = __LIG_PDB_JSON__;
     const gridBox = __GRID_BOX__;
     const interactions = __INTERACTIONS__;
     const isPubMode = __IS_PUB_MODE__;
@@ -455,8 +463,8 @@ def generate_3dmol_html(
         .replace("__HYDRO_COLOR__", hydro_color)
         .replace("__LABEL_BG__", label_bg)
         .replace("__LABEL_FG__", label_fg)
-        .replace("__REC_PDB__", rec_escaped)
-        .replace("__LIG_PDB__", lig_escaped)
+        .replace("__REC_PDB_JSON__", rec_json_str)
+        .replace("__LIG_PDB_JSON__", lig_json_str)
         .replace("__GRID_BOX__", grid_json)
         .replace("__INTERACTIONS__", interactions_json)
         .replace("__IS_PUB_MODE__", is_pub_mode_str)

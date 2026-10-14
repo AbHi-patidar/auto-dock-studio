@@ -10,6 +10,9 @@ from rdkit.Chem import Descriptors, Lipinski, AllChem
 from rdkit.Chem.Draw import rdMolDraw2D
 from PIL import Image, ImageDraw, ImageFont
 import io
+import logging
+
+logger = logging.getLogger("autodock_studio")
 
 def calculate_drug_likeness(smiles: str) -> dict:
     """
@@ -63,6 +66,14 @@ def _get_font(size: int, bold: bool = False):
                 return ImageFont.truetype(path, size)
             except Exception:
                 pass
+    global _FONT_WARNING_EMITTED
+    if not globals().get("_FONT_WARNING_EMITTED", False):
+        logger.warning(
+            "No system TrueType font found (looked for Segoe UI/Arial/Calibri); "
+            "2D diagrams will fall back to PIL's bitmap default font, which "
+            "degrades typography on non-Windows systems."
+        )
+        _FONT_WARNING_EMITTED = True
     return ImageFont.load_default()
 
 def _get_system_font_path():
